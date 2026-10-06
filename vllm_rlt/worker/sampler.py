@@ -102,6 +102,28 @@ class Sampler:
             raise ValueError("non-greedy sampling requires a generator")
         return self.draw(self.probabilities(logits, params), generator)
 
+    def sample_with_logprob(
+        self,
+        logits: torch.Tensor,
+        params: SamplingParams,
+        generator: torch.Generator | None,
+    ) -> tuple[torch.Tensor, torch.Tensor]:
+        """``sample()`` plus the 0-dim FP32 processed logprob of the drawn token.
+
+        The logprob is ``log_softmax`` of the same processed logits the token is
+        drawn from, so it equals ``token_logprob(..., "processed_logprobs")``
+        without rebuilding them; greedy rows report the unscaled distribution.
+        Tokens, generator requirements and RNG consumption are those of ``sample()``.
+        """
+        if params.temperature == 0:
+            token = logits.argmax()
+            return token, self.raw_logprobs(logits[None], token.view(1))[0]
+        if generator is None:
+            raise ValueError("non-greedy sampling requires a generator")
+        processed = self.processed_logits(logits, params)
+        token = self.draw(processed.softmax(-1), generator)
+        return token, self.raw_logprobs(processed[None], token.view(1))[0]
+
 
 class RngRegistry:
     """Per-request sampling generators for one engine.

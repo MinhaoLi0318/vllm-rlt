@@ -13,7 +13,7 @@ from vllm_rlt.core.scheduler import SchedulerOutput
 from vllm_rlt.request import Request, Stage
 from vllm_rlt.worker.buffers import Workspace
 from vllm_rlt.worker.cuda_graph import CodaGraphs, RecurrentGraphs
-from vllm_rlt.worker.logprobs import token_logprob
+from vllm_rlt.worker.logprobs import processed_logprobs, truncates
 from vllm_rlt.worker.sampler import RngRegistry, Sampler
 
 
@@ -558,9 +558,12 @@ class ModelRunner:
                     )
                 else:
                     logits = self.model.coda(hidden)
-                result = torch.stack([self._sample_row(row, r) for row, r in zip(logits, requests)])
                 if any(r.sampling_params.logprobs is not None for r in requests):
-                    logprobs = self._logprobs(logits, requests, result)
+                    result, logprobs = self._sample_with_logprobs(logits, requests)
+                else:
+                    result = torch.stack(
+                        [self._sample_row(row, r) for row, r in zip(logits, requests)]
+                    )
                 if routing is not None:
                     routing.scatter(result, tokens=True)
             else:
@@ -569,21 +572,31 @@ class ModelRunner:
             workspace.release()
         return StageOutput(result, logprobs)
 
-    def _logprobs(self, logits, requests, token_ids):
-        """FP32 [rows] logprobs of the sampled ``token_ids`` under ``self.logprobs_mode``.
+    def _sample_with_logprobs(self, logits, requests):
+        """Sampled IDs [rows] and FP32 logprobs [rows] of them under ``self.logprobs_mode``.
 
-        Raw mode scores every row in one batched op; processed mode scores only
-        rows that requested logprobs and leaves the others NaN. Either way, the
-        caller ignores rows that did not request logprobs.
+        Raw mode scores every row in one batched op. Processed mode samples a requesting
+        top-k/top-p row through ``_sample_with_logprob``, which scores the processed logits
+        it drew from, and scores the other requesting rows in temperature batches
+        (``processed_logprobs``); no row rebuilds its processed logits. All other rows
+        sample through ``_sample_row``. Both delegates draw identically, so tokens and
+        RNG use do not depend on logprobs. The caller ignores the values of rows that did
+        not request logprobs.
         """
+        rows = len(requests)
         if self.logprobs_mode == "raw_logprobs":
-            return Sampler.raw_logprobs(logits[: len(requests)], token_ids)
-        result = torch.full((len(requests),), torch.nan, dtype=torch.float32, device=logits.device)
-        for row, request in enumerate(requests):
-            params = request.sampling_params
-            if params.logprobs is not None:
-                result[row] = token_logprob(logits[row], params, token_ids[row], self.logprobs_mode)
-        return result
+            token_ids = torch.stack([self._sample_row(row, r) for row, r in zip(logits, requests)])
+            return token_ids, Sampler.raw_logprobs(logits[:rows], token_ids)
+        params = [r.sampling_params for r in requests]
+        tokens, truncated = [], {}
+        for index, (row, request) in enumerate(zip(logits, requests)):
+            if params[index].logprobs is not None and truncates(params[index]):
+                token, truncated[index] = self._sample_with_logprob(row, request)
+            else:
+                token = self._sample_row(row, request)
+            tokens.append(token)
+        token_ids = torch.stack(tokens)
+        return token_ids, processed_logprobs(logits[:rows], params, token_ids, truncated)
 
     def execute(self, batch: SchedulerOutput):
         """Return the stage's ``StageOutput`` as host lists."""
@@ -780,14 +793,25 @@ class ModelRunner:
     def _sample_row(self, logits: torch.Tensor, request: Request) -> torch.Tensor:
         """Sample one token for one logits row from the engine's RNG registry.
 
-        Greedy rows never acquire a generator. Otherwise the registry creates it on
+        Greedy rows sample without a generator. Otherwise the registry creates it on
         the distribution's device, so the generator follows the logits row rather
         than the device the model was loaded on.
         """
+        generator = self._row_generator(logits, request)
+        return self.sampler.sample(logits, request.sampling_params, generator)
+
+    def _sample_with_logprob(self, logits: torch.Tensor, request: Request):
+        """``_sample_row`` plus the processed logprob of the logits it drew from.
+
+        Used for processed-mode top-k/top-p rows that request logprobs. The generator
+        comes from ``_row_generator`` as in ``_sample_row``, so the token and RNG use
+        are those of ``_sample_row``.
+        """
+        generator = self._row_generator(logits, request)
+        return self.sampler.sample_with_logprob(logits, request.sampling_params, generator)
+
+    def _row_generator(self, logits: torch.Tensor, request: Request) -> torch.Generator | None:
         params = request.sampling_params
-        generator = (
-            None
-            if params.temperature == 0
-            else self.rng.acquire(request.request_id, params, logits.device)
-        )
-        return self.sampler.sample(logits, params, generator)
+        if params.temperature == 0:
+            return None
+        return self.rng.acquire(request.request_id, params, logits.device)

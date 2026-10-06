@@ -6,7 +6,9 @@ keep ``RngRegistry``'s own creation and lifetime contracts separate. The
 distribution tests state the sampling contract itself, including strict top-k:
 exactly ``k`` candidates survive by index, so a tie at the k-th logit does not
 widen the support. The rest cover ``token_logprob`` (``worker/logprobs.py``) in raw
-and processed modes and the registry's rejection of an unresolved ``seed=None``.
+and processed modes, the batched ``processed_logprobs`` and
+``Sampler.sample_with_logprob`` against it, and the registry's rejection of an
+unresolved ``seed=None``.
 """
 
 import math
@@ -16,7 +18,7 @@ import torch
 
 import vllm_rlt.worker.sampler as sampler_module
 from vllm_rlt.sampling_params import SamplingParams
-from vllm_rlt.worker.logprobs import token_logprob
+from vllm_rlt.worker.logprobs import processed_logprobs, token_logprob, truncates
 from vllm_rlt.worker.sampler import RngRegistry, Sampler
 
 
@@ -283,16 +285,16 @@ def test_raw_token_logprob_is_the_model_log_softmax_for_any_token(token):
         assert torch.equal(value, expected)
 
 
-@pytest.mark.parametrize(
-    "params",
-    [
-        SamplingParams(temperature=0.6, seed=1),
-        SamplingParams(temperature=1.3, top_k=3, seed=1),
-        SamplingParams(temperature=0.9, top_p=0.7, seed=1),
-        SamplingParams(temperature=0.8, top_k=4, top_p=0.9, seed=1),
-    ],
-    ids=["temperature", "temperature-top_k", "temperature-top_p", "temperature-top_k-top_p"],
-)
+PROCESSED_PARAMS = [
+    SamplingParams(temperature=0.6, seed=1),
+    SamplingParams(temperature=1.3, top_k=3, seed=1),
+    SamplingParams(temperature=0.9, top_p=0.7, seed=1),
+    SamplingParams(temperature=0.8, top_k=4, top_p=0.9, seed=1),
+]
+PROCESSED_IDS = ["temperature", "temperature-top_k", "temperature-top_p", "temperature-top_k-top_p"]
+
+
+@pytest.mark.parametrize("params", PROCESSED_PARAMS, ids=PROCESSED_IDS)
 def test_processed_token_logprob_scores_the_sampling_distribution(params):
     probs = Sampler.probabilities(LOGPROB_LOGITS, params)
     for token in range(len(LOGPROB_LOGITS)):
@@ -345,3 +347,94 @@ def test_token_logprob_consumes_no_rng():
         token_logprob(LOGPROB_LOGITS, params, token, logprobs_mode)
     assert torch.equal(generator.get_state(), state)
     assert torch.equal(torch.get_rng_state(), global_state)
+
+
+@pytest.mark.parametrize(
+    "params", [SamplingParams(top_k=1), *PROCESSED_PARAMS], ids=["greedy", *PROCESSED_IDS]
+)
+def test_sample_with_logprob_draws_like_sample_and_scores_the_drawn_logits(params):
+    sampler, plain, scored = Sampler(), seeded_generator(params), seeded_generator(params)
+    initial = plain.get_state().clone()
+    for _ in range(4):
+        token = sampler.sample(LOGPROB_LOGITS, params, plain)
+        same, logprob = sampler.sample_with_logprob(LOGPROB_LOGITS, params, scored)
+        assert torch.equal(same, token)
+        expected = token_logprob(LOGPROB_LOGITS, params, token, "processed_logprobs")
+        assert torch.equal(logprob, expected)
+    # Same RNG consumption as sample(): none for greedy rows, which ignore the generator.
+    assert torch.equal(plain.get_state(), scored.get_state())
+    assert torch.equal(scored.get_state(), initial) == (params.temperature == 0)
+    if params.temperature != 0:  # Like sample(), never a silent global-RNG fallback.
+        with pytest.raises(ValueError, match="requires a generator"):
+            sampler.sample_with_logprob(LOGPROB_LOGITS, params, None)
+
+
+# One row per processed-logprob path: batched raw (greedy, even with top-k, and T == 1), batched
+# per temperature, the sampler's top-k/top-p logits, and (last) a row without logprobs.
+BATCH_PARAMS = [
+    SamplingParams(temperature=0.0, top_k=3, logprobs=0),
+    SamplingParams(temperature=1.0, logprobs=0, seed=1),
+    SamplingParams(temperature=0.7, logprobs=0, seed=2),
+    SamplingParams(temperature=1.3, logprobs=0, seed=3),
+    SamplingParams(temperature=0.9, top_k=8, logprobs=0, seed=4),
+    SamplingParams(temperature=1.0, top_p=0.8, logprobs=0, seed=5),
+    SamplingParams(temperature=0.7, top_k=16, top_p=0.9, logprobs=0, seed=6),
+    SamplingParams(temperature=0.8, seed=7),
+]
+
+
+ROWS = 48  # Rows laid out by a BATCH_LAYOUTS entry; a row without logprobs follows them.
+
+
+def at(temperature):
+    return SamplingParams(temperature=temperature, logprobs=0, seed=1)
+
+
+# Layout -> (row -> params, log_softmax passes of processed_logprobs or None: only bounded).
+BATCH_LAYOUTS = {
+    "mixed": (lambda row: BATCH_PARAMS[row % 8], None),
+    "t1": (lambda row: BATCH_PARAMS[1], 1),  # The only group: one pass over the whole batch.
+    "t0.7": (lambda row: BATCH_PARAMS[2], 1),
+    "top_k-top_p": (lambda row: BATCH_PARAMS[4 + row % 3], 0),
+    # Many temperatures: one per row; rows r and ROWS - 1 - r sharing one (nested spans, the
+    # outer ones scored row by row); two alternating (one pass per overlapping span).
+    "distinct_t": (lambda row: at(0.5 + 0.01 * row), ROWS),
+    "nested_t": (lambda row: at(0.5 + 0.01 * min(row, ROWS - 1 - row)), None),
+    "alternating_t": (lambda row: at((0.7, 1.3)[row % 2]), 2),
+}
+
+
+@pytest.mark.parametrize("dtype", [torch.float32, torch.bfloat16])
+@pytest.mark.parametrize("layout", BATCH_LAYOUTS.values(), ids=BATCH_LAYOUTS.keys())
+def test_batched_processed_logprobs_equal_per_row_token_logprob(monkeypatch, layout, dtype):
+    params = [layout[0](row) for row in range(ROWS)] + [BATCH_PARAMS[-1]]
+    logits = 4 * torch.randn(len(params), 256, generator=torch.Generator().manual_seed(0))
+    logits, sampler, tokens, truncated = logits.to(dtype), Sampler(), [], {}
+    for row, row_params in enumerate(params):  # As ModelRunner._sample_with_logprobs.
+        # A fresh generator per row, as RngRegistry.acquire creates on a first draw.
+        generator = None if row_params.temperature == 0 else seeded_generator(row_params)
+        if row_params.logprobs is not None and truncates(row_params):
+            token, truncated[row] = sampler.sample_with_logprob(logits[row], row_params, generator)
+        else:
+            token = sampler.sample(logits[row], row_params, generator)
+        tokens.append(token)
+    token_ids, passes = torch.stack(tokens), []  # passes: rows scored by each log_softmax.
+
+    raw_logprobs = Sampler.raw_logprobs
+
+    def counted(logits, token_ids):
+        passes.append(len(logits))
+        return raw_logprobs(logits, token_ids)
+
+    monkeypatch.setattr(Sampler, "raw_logprobs", staticmethod(counted))
+    values = processed_logprobs(logits, params, token_ids, truncated)
+    monkeypatch.undo()
+    # However many temperatures mix, at most twice the batched rows are scored (57d2308 scored
+    # each requesting row once, in a pass of its own).
+    assert sum(passes) <= 2 * (sum(p.logprobs is not None for p in params) - len(truncated))
+    assert layout[1] is None or len(passes) == layout[1]
+    assert values.shape == (len(params),) and values.dtype == torch.float32
+    for row, row_params in enumerate(params):
+        if row_params.logprobs is not None:
+            expected = token_logprob(logits[row], row_params, token_ids[row], "processed_logprobs")
+            assert torch.equal(values[row], expected)
