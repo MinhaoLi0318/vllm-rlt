@@ -645,6 +645,58 @@ def test_speculative_update_slices_logprobs(monkeypatch, finish, max_tokens, cou
     assert runner.stats.committed_tokens == len(emitted)
 
 
+@pytest.mark.parametrize(
+    "finish,max_tokens,emitted",
+    [
+        ("round", 9, [10, 50, 0, 13]),
+        ("stop_token_ids", 9, [10, 50]),
+        ("eos", 9, [10, 50, 0]),
+        ("length", 3, [10, 50]),
+    ],
+    ids=["continue", "stop-id-mid-round", "eos-mid-round", "length-at-round-end"],
+)
+def test_async_speculative_collect_uses_shared_finish_rules(finish, max_tokens, emitted):
+    """Deliver one async speculative round on CPU. The runner needs CUDA, so a stub ticket
+    stands in for its readback; _collect_speculative itself is the code under test."""
+    engine = LLMEngine(model(), speculative_config=SpeculativeConfig(3))
+    stops = [50] if finish == "stop_token_ids" else []
+    params = SamplingParams(max_tokens=max_tokens, ignore_eos=finish != "eos", stop_token_ids=stops)
+    engine.add_request("r", [2, 3], params)
+    request = engine.scheduler.requests["r"]
+    stream(engine, lambda: request.generated_token_ids)  # The bootstrap CODA token.
+    batch = engine.scheduler.schedule()
+    [item] = batch.items
+    # Mirror _step_async_speculative's submission bookkeeping, then deliver the round.
+    request.num_output_placeholders, request.num_speculative_rounds = item.token_count, 1
+    engine.scheduler.enqueue(request, Stage.SPECULATIVE)
+    tokens = [10, 50, 0, 13][: item.token_count]
+    frontier = len(request.prompt_token_ids) + len(request.generated_token_ids) - 1 + len(tokens)
+    result = SpeculativeResult(tokens, len(tokens) - 1, len(tokens) - 1)
+    ticket = SimpleNamespace(
+        batch=batch,
+        states=(SimpleNamespace(delivered=0),),
+        rounds=(0,),
+        ready=lambda: True,
+        collect=lambda: ([result], [frontier]),
+        retire=lambda: None,
+    )
+    stats = engine.speculative_runner.stats
+    engine.speculative_runner = SimpleNamespace(
+        stats=stats, readback_waits=0, request_ready=lambda r: True, release=lambda r: None
+    )
+    engine.async_speculative, engine._pending_speculative = True, [ticket]
+    [output] = engine._collect_speculative()
+    reason = {"round": None, "length": "length"}.get(finish, "stop")
+    assert (output.token_ids[1:], output.finish_reason) == (emitted, reason)
+    assert output.exit_depths == [4] * len(output.token_ids) and output.logprobs is None
+    assert stats.committed_tokens == len(emitted) and request.num_output_placeholders == 0
+    if reason is None:
+        assert list(engine.scheduler.queues[Stage.SPECULATIVE]) == ["r"]
+    else:
+        assert not engine.has_unfinished_requests()
+        assert engine.cache_manager.num_used_blocks == 0
+
+
 def test_pd_coordinator_resolves_seeds_and_mirrors_logprobs():
     engine = object.__new__(PDEngine)  # Coordinator only: no worker processes.
     engine.closed, engine.failure = False, None
@@ -812,6 +864,52 @@ def test_execution_error_returns_undelivered_logprob_leases(monkeypatch, device)
     monkeypatch.setattr(Submission, "ready", ready)
     engine.add_request("3", [2, 3], gpu_params("3", max_tokens=4))
     check_aligned(final(stream(engine))["3"])
+
+
+@pytest.mark.gpu
+def test_gpu_async_speculative_stop_token_ids_match_sync():
+    """Cross-round async speculation (CUDA, Triton, greedy) stops on stop IDs like sync."""
+    m = model(device="cuda")
+    prompts = {"a": [2, 3, 4, 5], "b": [9], "c": [2, 3, 4, 7]}
+
+    def run(asynchronous, **overrides):
+        engine = LLMEngine(
+            m,
+            attention_backend="triton",
+            cache_config=CacheConfig(256, 2, incremental_allocation=True),
+            scheduler_config=SchedulerConfig(
+                max_num_seqs=4, max_num_batched_tokens=16, prefill_chunk_size=2
+            ),
+            execution_config=ExecutionConfig(async_scheduling=asynchronous),
+            speculative_config=SpeculativeConfig(3),
+        )
+        for rid, prompt in prompts.items():
+            params = SamplingParams(max_tokens=16, ignore_eos=True, **overrides)
+            engine.add_request(rid, prompt, params)
+        outputs = final(stream(engine))
+        engine.close()
+        return outputs
+
+    free = run(False)
+    # Stop on the latest first occurrence after the bootstrap token, so a round is cut.
+    first = {
+        (rid, i): t
+        for rid, o in free.items()
+        for i, t in enumerate(o.token_ids)
+        if i > 0 and t not in o.token_ids[:i]
+    }
+    assert first, "greedy outputs repeat their bootstrap token; pick other prompts"
+    stop = first[max(first, key=lambda key: key[1])]
+    expected, actual = run(False, stop_token_ids=[stop]), run(True, stop_token_ids=[stop])
+    assert any(o.finish_reason == "stop" for o in expected.values())
+    for rid, output in expected.items():
+        tokens = free[rid].token_ids
+        cut = tokens[: tokens.index(stop) + 1] if stop in tokens else tokens
+        assert output.token_ids == cut
+        assert (actual[rid].token_ids, actual[rid].finish_reason) == (
+            output.token_ids,
+            output.finish_reason,
+        )
 
 
 @pytest.mark.gpu

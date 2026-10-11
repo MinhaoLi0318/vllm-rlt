@@ -538,19 +538,15 @@ class LLMEngine:
             expected = len(request.prompt_token_ids) + len(request.generated_token_ids) - 1
             if frontier != expected + len(result.token_ids):
                 raise RuntimeError("speculative GPU frontier disagrees with committed prefix")
-            params = request.sampling_params
-            eos = self.model.config.eos_token_id
-            eos_ids = eos if isinstance(eos, (tuple, list)) else [eos]
             emitted = 0
-            for token in result.token_ids:
-                request.generated_token_ids.append(token)
-                request.exit_depths.append(self.speculative_config.target_loops)
+            for index, token in enumerate(result.token_ids):
+                logprob = result.logprobs[index] if request.logprobs is not None else None
+                reason = self._append_output(
+                    request, token, self.speculative_config.target_loops, logprob
+                )
                 emitted += 1
-                if token in eos_ids and not params.ignore_eos:
-                    self._finish(request, FinishReason.STOP)
-                    break
-                if len(request.generated_token_ids) >= params.max_tokens:
-                    self._finish(request, FinishReason.LENGTH)
+                if reason is not None:
+                    self._finish(request, reason)
                     break
             runner.stats.committed_tokens += emitted
             runner.stats.accepted_tokens += min(result.accepted_count, emitted)
