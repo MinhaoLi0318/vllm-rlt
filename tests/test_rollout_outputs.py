@@ -662,9 +662,9 @@ def speculative_llm(m, logprobs_mode="raw_logprobs", **kwargs):
 @pytest.mark.parametrize("logprobs_mode", LOGPROBS_MODES)
 def test_speculative_logprobs_match_full_depth_reference(monkeypatch, logprobs_mode):
     """Every committed token (accepted, correction, bonus) is scored under the target p on
-    its verification row, which equals a teacher-forced forward at the model depth. The
-    mixed batch puts greedy (raw-scored), sampled (processed-scored in processed mode) and
-    non-requesting rows in the same rounds."""
+    its verification row, which matches a teacher-forced forward at the model depth
+    numerically. The mixed batch puts greedy (raw-scored), sampled (processed-scored in
+    processed mode) and non-requesting rows in the same rounds."""
     m = model()
     prompts = [[2, 3], [7, 8, 9], [5], [4, 6]]
     runs = {name: [rollout(max_tokens=12, **o)] * 4 for name, o in SPECULATIVE_SAMPLING.items()}

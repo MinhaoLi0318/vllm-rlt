@@ -300,8 +300,9 @@ This covers an accepted draft token, the correction after a rejection, and the b
 token. The draft distribution q never enters `logprobs`:
 
 - Verification resumes from the hidden state and KV that the draft loops computed
-  with the same weights. The scores therefore equal a full-depth forward, and the
-  rollout replays like any other full-depth rollout.
+  with the same weights. The scores therefore match a full-depth forward
+  numerically, not necessarily bitwise. The rollout replays like any other
+  full-depth rollout.
 - A correction is drawn from the residual `(p - q)+`. The round's output is still
   distributed as p, so its policy logprob is `log p[token]`.
 - For a given seed, the sampled tokens depend on q, because draft draws and
