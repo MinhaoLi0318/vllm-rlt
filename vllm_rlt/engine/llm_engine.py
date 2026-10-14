@@ -158,6 +158,7 @@ class LLMEngine:
                 speculative_config,
                 self.execution_config,
                 rng=self.rng,
+                logprobs_mode=logprobs_mode,
             )
             if speculative_config is not None
             else None
@@ -181,6 +182,7 @@ class LLMEngine:
                 scheduler_config,
                 multi_stream=self.execution_config.multi_stream,
                 rng=self.rng,
+                logprobs_mode=logprobs_mode,
             )
         self._pending_speculative = []
         self._retiring_speculative = {}
@@ -228,8 +230,6 @@ class LLMEngine:
             max_loops != self.speculative_config.target_loops or params.exit_threshold != 1.0
         ):
             raise ValueError("speculative requests require fixed target depth and exit_threshold=1")
-        if self.speculative_config is not None and params.logprobs is not None:
-            raise ValueError("logprobs are not supported with speculative decoding yet")
         if trace_id is not None:
             if not isinstance(trace_id, str) or not trace_id:
                 raise ValueError("trace_id must be a nonempty string")
