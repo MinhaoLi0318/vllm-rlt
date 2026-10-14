@@ -317,7 +317,7 @@ class AsyncSpeculativeRunner(SpeculativeRunner):
         self.stats.rounds += len(items)
         self.stats.drafted_tokens += sum(item.token_count - 1 for item in items)
         self.stats.verified_rows += count
-        return SpeculativeRoundTicket(batch, buffer, states, rounds, count, scoring)
+        return SpeculativeRoundTicket(batch, buffer, states, rounds, count, logprobs_copied=scoring)
 
     def request_ready(self, request):
         state = self.states.get(request.request_id)
