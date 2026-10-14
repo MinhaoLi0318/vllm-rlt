@@ -485,7 +485,10 @@ def test_preemption_at_each_stage_keeps_the_rng_slot(asynchronous, stage, logpro
             assert torch.equal(generator.get_state(), state)
         results.append(final(stream(engine))["a"])
         assert engine.preemption.resumptions == int(preempt)
-    assert_same(results[1], results[0])
+    # A CODA victim resumes into "b"'s CODA batch, so its LM head runs two rows instead of
+    # one. CPU GEMMs are not batch invariant, so its logprobs match numerically (up to ~5e-7).
+    # PRELUDE and RECURRENT victims share no batch with "b": theirs stay bitwise.
+    assert_same(results[1], results[0], atol=1e-6 if stage == Stage.CODA else None)
 
 
 @pytest.mark.parametrize("logprobs_mode", LOGPROBS_MODES)
