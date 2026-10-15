@@ -24,6 +24,7 @@ from vllm_rlt.pd.config import PDConfig
 from vllm_rlt.pd.engine import PDEngine, PDModelInfo, Peer
 from vllm_rlt.request import RequestOutput, Stage
 from vllm_rlt.serving.protocol import CompletionRequest
+from vllm_rlt.worker.async_speculative import SpeculativeRoundTicket
 from vllm_rlt.worker.logprobs import token_logprob
 from vllm_rlt.worker.model_runner import ReadbackSlot, Submission
 from vllm_rlt.worker.sampler import Sampler
@@ -815,6 +816,44 @@ def test_async_speculative_collect_uses_shared_finish_rules(finish, max_tokens, 
     else:
         assert not engine.has_unfinished_requests()
         assert engine.cache_manager.num_used_blocks == 0
+
+
+def test_async_speculative_ticket_scores_only_requesting_rows():
+    """The async runner needs CUDA, so stub buffers drive SpeculativeRoundTicket.collect: in a
+    scored round each request that asked gets its committed rows' scores, the others None."""
+
+    class Done:
+        def query(self):
+            return True
+
+        def synchronize(self):
+            pass
+
+    def collect(logprobs_copied, wants):
+        # Two requests with 3 and 2 verification rows; 1 and 0 drafts accepted.
+        buffer = SimpleNamespace(
+            host_result=torch.tensor([7, 8, 9, 4, 5, 1, 0, 12, 20]),
+            host_logprobs=torch.tensor([-0.1, -0.2, -0.3, -0.4, -0.5]),
+            copy_done=Done(),
+        )
+        params = [SamplingParams(logprobs=0 if w else None) for w in wants]
+        items = [
+            SimpleNamespace(request=SimpleNamespace(sampling_params=p), token_count=n)
+            for p, n in zip(params, (3, 2))
+        ]
+        batch = SimpleNamespace(items=items)
+        ticket = SpeculativeRoundTicket(
+            batch, buffer, (), (0, 0), 5, logprobs_copied=logprobs_copied
+        )
+        return ticket.collect()
+
+    results, frontiers = collect(True, (True, False))
+    assert [r.token_ids for r in results] == [[7, 8], [4]] and frontiers == [12, 20]
+    assert results[0].logprobs == pytest.approx([-0.1, -0.2]) and results[1].logprobs is None
+    results, _ = collect(True, (False, True))
+    assert results[0].logprobs is None and results[1].logprobs == pytest.approx([-0.4])
+    results, _ = collect(False, (True, True))
+    assert [r.logprobs for r in results] == [None, None]
 
 
 def test_pd_coordinator_resolves_seeds_and_mirrors_logprobs():
